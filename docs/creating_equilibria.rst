@@ -218,7 +218,6 @@ Note that the location of these walls does not currently affect the
 equilibrium, but is used by some diagnostics, and is written to
 output files such as EQDSK format.
 
-
 Sensors
 -----------------------------
 Rogowski (Rog), Poloidal Field (BP), and Flux Loop (FL) sensors can be added to the machine.
