@@ -418,7 +418,7 @@ class Equilibrium:
             :, 0:2
         ]
 
-    def solve(self, profiles, Jtor=None, psi=None, psi_bndry=None):
+    def solve(self, profiles=None, Jtor=None, psi=None, psi_bndry=None):
         """
         Calculate the plasma equilibrium given new profiles
         replacing the current equilibrium.
@@ -441,7 +441,9 @@ class Equilibrium:
                      If not given then X-point locations are used.
         """
 
-        self._profiles = profiles
+        if profiles is not None:
+            self._profiles = profiles
+
         self._updateBoundaryPsi()
 
         if Jtor is None:
