@@ -33,9 +33,10 @@ from .coil import Coil, AreaCurrentLimit
 from .shaped_coil import ShapedCoil
 from .pre_calc_coil import PreCalcCoil
 from .filament_coil import FilamentCoil
+from .multi_coil import MultiCoil
+
 from shapely.geometry import Point, LinearRing, LineString
 from shapely.geometry.polygon import Polygon
-
 
 # We need this for the `label` part of the Circuit dtype for writing
 # to HDF5 files. See the following for information:
@@ -89,6 +90,40 @@ class Circuit:
         self.coils = coils
         self.current = current
         self.control = control
+    
+    def __getitem__(self, name):
+        """Returns a coil in the circuit using circuit[coil_name]"""
+
+        for label, coil, _ in self.coils:
+            if label == name:
+                return coil
+        raise KeyError("Circuit does not contain coil with label '{0}'".format(name))
+    
+    @property
+    def current(self) -> float:
+        return self._current
+
+    @current.setter
+    def current(self, value: float):
+        """
+        When updating the circuit current, also update the current in the coils in the circuit (with multipliers)
+        """
+        self._current = value
+        for _, coil, multiplier in self.coils:
+            coil.current = multiplier * value
+
+    @property
+    def control(self) -> bool:
+        return self._control
+
+    @control.setter
+    def control(self, value: bool):
+        """
+        When updating the circuit control switch, also update the control switch in the coils in the circuit
+        """
+        self._control = value
+        for _, coil, _ in self.coils:
+            coil.control = value
 
     def psi(self, R, Z):
         """
@@ -299,7 +334,7 @@ class Solenoid:
             (str("Zsmax"), np.float64),
             (str("Ns"), np.float64),
             (str("current"), np.float64),
-            (str("control"), np.bool),
+            (str("control"), bool),
         ]
     )
 
@@ -505,10 +540,6 @@ class RogowskiSensor(Sensor):
             for label, coil in tokamak.coils:
                 coil_current += coil.inShape(self.polygon) * coil.current
 
-            if tokamak.vessel is not None:
-                for filament in tokamak.vessel:
-                    coil_current += filament.currentInShape(self.polygon)
-
             # plasma current
             plasma_current = 0
             if eq is not None:
@@ -526,21 +557,6 @@ class RogowskiSensor(Sensor):
                                       * self.polygon.intersection(gridpoint).area
 
             self.measurement = plasma_current + coil_current
-
-
-    # Methods used in Reconstruction for generating the Greens matrices
-    def get_PlasmaGreensRow(self, eq):
-        greens_row = np.zeros(eq.nx*eq.ny)
-        for index, (R,Z) in enumerate(zip(eq.R.flatten(order = 'F'),eq.Z.flatten(order = 'F'))):
-                if self.polygon.contains(Point(R, Z)):
-                    greens_row[index] = eq.dR * eq.dZ
-        return greens_row
-
-    def get_CoilGreensRow(self, coil):
-        return coil.inShape(self.polygon)
-
-    def get_VesselGreensRow(self, passive):
-        return passive.inShape(self.polygon)
 
     def plot(self, axis):
         axis.plot(list(self.R) + [self.R[0]],
@@ -575,17 +591,6 @@ class PoloidalFieldSensor(Sensor):
 
             self.measurement = field
 
-    # Methods used in Reconstruction for generating the Greens matrices
-    def get_PlasmaGreensRow(self, eq):
-        return eq.dR * eq.dZ * (GreensBr(eq.R.flatten(order = 'F'), eq.Z.flatten(order = 'F'), self.R,self.Z) * np.cos(self.theta)
-                                + GreensBz(eq.R.flatten(order = 'F'), eq.Z.flatten(order = 'F'), self.R,self.Z) * np.sin(self.theta))
-
-    def get_CoilGreensRow(self, coil):
-        return np.cos(self.theta) * coil.controlBr(self.R,self.Z) + np.sin(self.theta) * coil.controlBz(self.R, self.Z)
-
-    def get_VesselGreensRow(self, passive):
-        return np.cos(self.theta) * passive.controlBr(self.R,self.Z) + np.sin(self.theta) * passive.controlBz(self.R, self.Z)
-
     def plot(self, axis):
         axis.plot(self.R, self.Z, 'mo')
         axis.arrow(self.R, self.Z, 0.1 * np.cos(self.theta),
@@ -615,118 +620,8 @@ class FluxLoopSensor(Sensor):
 
             self.measurement = psi
 
-    # Methods used in Reconstruction for generating the Greens matrices
-    def get_PlasmaGreensRow(self, eq):
-        return eq.dR * eq.dZ * Greens(eq.R.flatten(order = 'F'), eq.Z.flatten(order = 'F'), self.R,self.Z)
-
-    def get_CoilGreensRow(self, coil):
-        return coil.controlPsi(self.R,self.Z)
-
-    def get_VesselGreensRow(self, passive):
-        return passive.controlPsi(self.R,self.Z)
-
     def plot(self, axis):
         axis.plot(self.R, self.Z, 'ro')
-
-
-class Filament(Coil):
-    """
-    Represents a filament in the vessel structure, capable of carrying currents
-    """
-
-    def __init__(self, R, Z, dR, dZ, resistivity, name, current=0):
-        Coil.__init__(self, R, Z, current=current, control=False)
-        self.name = name
-        self.dR = dR
-        self.dZ = dZ
-        self.resistance = 2 * np.pi * self.R * resistivity / (self.dR * self.dZ)
-
-    def updateFilamentCurrent(self, current):
-        self.current = current
-
-
-class Passive:
-    def __init__(self, filaments, name, n_basis=10):
-        self.filaments = filaments
-        self.name = name
-        self.n_fils = len(self.filaments)
-        self.n_basis = n_basis
-        self.eigenbasis = self.calcEigenbasis()
-
-    def psi(self, R, Z):
-        """
-        Calculate poloidal flux at (R,Z)
-        """
-        return sum([filament.psi(R,Z) for filament in self.filaments])
-
-    def createPsiGreens(self, R, Z):
-        """
-        Calculate Greens functions
-        """
-        pgreen = {filament.name:filament.createPsiGreens(R, Z) for filament in self.filaments}
-        return pgreen
-
-    def calcPsiFromGreens(self, pgreen):
-        """
-        Calculate psi from Greens functions
-        """
-        return sum([filament.calcPsiFromGreens(pgreen[filament.name]) for filament in self.filaments])
-
-    def Br(self, R, Z):
-        """
-        Calculate radial magnetic field Br at (R,Z)
-        """
-        return sum([filament.Br(R, Z) for filament in self.filaments])
-
-    def Bz(self, R, Z):
-        """
-        Calculate vertical magnetic field Bz at (R,Z)
-        """
-        return sum([filament.Bz(R, Z) for filament in self.filaments])
-
-    def currentInShape(self,polygon):
-        return sum(filament.inShape(polygon)*filament.current for filament in self.filaments)
-
-    def inShape(self,polygon):
-        return sum(filament.inShape(polygon) for filament in self.filaments)
-
-    def updateFilamentCurrent(self, vessel_currents, filament_index):
-        passive_currents = vessel_currents[filament_index:]
-        for index, filament in enumerate(self.filaments):
-            filament.updateFilamentCurrent(passive_currents[index])
-
-    def calcEigenbasis(self):
-        R = np.zeros((self.n_fils, self.n_fils))
-        M = np.zeros((self.n_fils, self.n_fils))
-
-        # Ppopulating Mutual inductance matrix
-        for i, fil in enumerate(self.filaments):
-            R[i, i] = fil.resistance
-
-            for j in range(i, len(self.filaments)):
-                fil2 = self.filaments[j]
-
-                R1, R2, Z1, Z2 = fil.R, fil2.R, fil.Z, fil2.Z
-
-                # Calcluating self inductance
-                if i == j:
-                    M12 = mu_0 * R1 * (np.log(8 * R1 / (fil.dR + fil.dZ)) - 1 / 2)
-
-                # Calculating Mutual Inductance between filaments
-                else:
-                    k = 2 * (R1 * R2) ** 0.5 / ((R1 + R2) ** 2 + (Z1 - Z2) ** 2) ** 0.5
-                    M12 = mu_0 * (R1 * R2) ** 0.5 * ((2 / k - k) * ellipk(k ** 2) - 2 / k * ellipe(k ** 2))
-
-                M[i, j] = M12
-                M[j, i] = M12
-
-        J = scipy.linalg.lstsq(M,R)[0]
-
-        eigvals, eigvecs = np.linalg.eig(J)
-
-        sorted_eigvecs = [x for _, x in sorted(zip(eigvals, np.transpose(eigvecs)), reverse=False)]
-
-        return np.asarray(sorted_eigvecs[:self.n_basis]).T
 
 
 class Machine:
@@ -742,8 +637,7 @@ class Machine:
 
     """
 
-    def __init__(self, coils, wall=None, sensors=None, vessel=None, nlimit=500):
-
+    def __init__(self, coils, wall=None, sensors=None, nlimit=500):
         """
         coils - A list of coils [(label, Coil|Circuit|Solenoid)]
         sensors - A list of sensors
@@ -752,19 +646,14 @@ class Machine:
         self.coils = coils
         self.wall = wall
         self.sensors = sensors
-        self.vessel = vessel
 
         self.limit_points_R = None
         self.limit_points_Z = None
 
         if self.wall is not None:
-            self.limit_points_R, self.limit_points_Z = self.generate_limit_points(nlimit)
-
-        if self.vessel is not None:
-            self.eigenbasis = self.getVesselEigenbasis()
-
-        self.generate_list_lengths()
-
+            self.limit_points_R, self.limit_points_Z = self.generate_limit_points(
+                nlimit
+            )
 
     def __repr__(self):
         return "Machine(coils={coils}, wall={wall})".format(
@@ -785,77 +674,46 @@ class Machine:
                 return coil
         raise KeyError("Machine does not contain coil with label '{0}'".format(name))
 
-    def generate_list_lengths(self):
-        if self.coils is not None:
-            self.n_coils = len(self.coils)
-        else:
-            self.n_coils = 0
-
-
-        if self.sensors is not None:
-            self.n_sensors = len(self.sensors)
-        else:
-            self.n_sensors = 0
-
-        if self.vessel is not None: # i know i need to change the is not None
-            self.n_fils = sum(fil.n_fils for fil in self.vessel)
-            self.n_basis =  sum(fil.n_basis for fil in self.vessel)
-        else:
-            self.n_fils = 0
-            self.n_basis = 0
-
-
-    def generate_limit_points(self,nlimit):
-        '''
+    def generate_limit_points(self, nlimit):
+        """
         Generate points along the machine wall that may be used to check
         if the plasma is limited or not.
-        '''
+        """
 
         # Interpolate wall limit points.
         # Make an interpolator for point location as function of normalised distance
         # along the wall
-        points = np.array([self.wall.R,self.wall.Z]).T
-        distance = np.cumsum(np.sqrt(np.sum(np.diff(points,axis=0)**2,axis=1)))
-        distance = np.insert(distance,0,0)/distance[-1]
+        points = np.array([self.wall.R, self.wall.Z]).T
+        distance = np.cumsum(np.sqrt(np.sum(np.diff(points, axis=0) ** 2, axis=1)))
+        distance = np.insert(distance, 0, 0) / distance[-1]
 
-
-        interpolator = interp1d(distance,points,kind='linear',axis=0)
-        new_distances = np.linspace(0,1,nlimit,endpoint=True)
+        interpolator = interp1d(distance, points, kind="linear", axis=0)
+        new_distances = np.linspace(0, 1, nlimit, endpoint=True)
         interpolated_points = interpolator(new_distances)
 
-        R = np.asarray(interpolated_points[:,0])
-        Z = np.asarray(interpolated_points[:,1])
+        R = np.asarray(interpolated_points[:, 0])
+        Z = np.asarray(interpolated_points[:, 1])
 
         return R, Z
 
     def psi(self, R, Z):
         """
-        Poloidal flux due to coils and vessel filaments
+        Poloidal flux due to coils
         """
         psi_coils = 0.0
         for label, coil in self.coils:
             psi_coils += coil.psi(R, Z)
-
-        if self.vessel is not None:
-            for passive in self.vessel:
-                psi_coils += passive.psi(R, Z)
-
         return psi_coils
 
     def createPsiGreens(self, R, Z):
         """
         An optimisation, which pre-computes the Greens functions
-        and puts into arrays for each coil and vessel filament. This map can then be
+        and puts into arrays for each coil. This map can then be
         called at a later time, and quickly return the field
         """
         pgreen = {}
         for label, coil in self.coils:
             pgreen[label] = coil.createPsiGreens(R, Z)
-
-        if self.vessel is not None:
-            for passive in self.vessel:
-                pgreen[passive.name] = passive.createPsiGreens(R, Z)
-
         return pgreen
 
     def calcPsiFromGreens(self, pgreen):
@@ -867,10 +725,6 @@ class Machine:
         for label, coil in self.coils:
             psi_coils += coil.calcPsiFromGreens(pgreen[label])
 
-        if self.vessel is not None:
-            for passive in self.vessel:
-                psi_coils += passive.calcPsiFromGreens(pgreen[passive.name])
-
         return psi_coils
 
     def Br(self, R, Z):
@@ -881,10 +735,6 @@ class Machine:
         for label, coil in self.coils:
             Br += coil.Br(R, Z)
 
-        if self.vessel is not None:
-            for passive in self.vessel:
-                Br += passive.Br(R, Z)
-
         return Br
 
     def Bz(self, R, Z):
@@ -894,10 +744,6 @@ class Machine:
         Bz = 0.0
         for label, coil in self.coils:
             Bz += coil.Bz(R, Z)
-
-        if self.vessel is not None:
-            for passive in self.vessel:
-                Bz += passive.Bz(R, Z)
 
         return Bz
 
@@ -944,7 +790,7 @@ class Machine:
     def setControlCurrents(self, currents):
         """
         Sets the currents in the coils being controlled.
-        Input list m/ust be of the same length as the list
+        Input list must be of the same length as the list
         returned by controlCurrents
         """
         controlcoils = [coil for label, coil in self.coils if coil.control]
@@ -1006,32 +852,6 @@ class Machine:
             currents[label] = coil.current
         return currents
 
-    def updateCoilCurrents(self, currents):
-        for index, (name, coil) in enumerate(self.coils):
-            coil.current = currents[index][0]
-
-    def updateVesselCurrents(self, vessel_currents):
-        """
-        Loops through filaments in vessel, assigns them each the corresponding
-        given value of current
-
-        Parameters
-        ----------
-        vessel_currents - ordered array of currents
-        """
-        filament_index = 0
-        for index, passive in enumerate(self.vessel):
-            passive.updateFilamentCurrent(vessel_currents, filament_index)
-            filament_index += index * passive.n_basis
-
-    def getVesselEigenbasis(self):
-        """
-        Builds the eigenbasis of the tokamak
-        """
-        eigenbasis_list = (passive.eigenbasis for passive in self.vessel)
-        eigenbasis = scipy.linalg.block_diag(*eigenbasis_list)
-        return eigenbasis
-
     def plot(self, axis=None, show=True):
         """
         Plot the machine coils
@@ -1043,28 +863,6 @@ class Machine:
 
             plt.show()
         return axis
-
-    def plot_eigenbasis(self):
-        """
-        Plotting the eigenbasis for each passive
-        """
-        import matplotlib.pyplot as plt
-
-        for passive in self.vessel:
-            for i in range(passive.eigenbasis.shape[1]):
-                eigenfunction = self.eigenbasis[:, i]
-                fig = plt.figure()
-                ax = fig.add_subplot(111)
-                ax.set_aspect('equal')
-
-                for j, filament in enumerate(passive.filaments):
-                    size = abs(eigenfunction[j]) * 400
-
-                    if eigenfunction[j] >= 0:
-                        ax.scatter(filament.R, filament.Z, color='red', s=size)
-                    else:
-                        ax.scatter(filament.R, filament.Z, color='black', s=size)
-            plt.show()
 
 
 def EmptyTokamak():
@@ -1094,6 +892,7 @@ def TestTokamak():
     )  # Z
 
     return Machine(coils, wall)
+
 
 def TestTokamakLimited():
     """
@@ -1155,116 +954,71 @@ def TestTokamakSensor():
     return Machine(coils, wall, sensors)
 
 
-def EfitTestMachine():
-    """
-    Creating a simple tokamak
-    Option to add vessel filaments
-    Used for reconstruction
-    """
-
-    def createVesselFilaments(wall, n_fils=100):
-        wallRZ = [[R, Z] for R, Z in zip(wall.R, wall.Z)]
-
-        # Generating filament points
-        R0 = wallRZ[0]
-        wallRZ.append(R0)
-        innerline = LineString(wallRZ)
-        distances = np.linspace(0, innerline.length, n_fils + 1)
-        points = [innerline.interpolate(distance).xy for distance in distances]
-        rfils = [point[0][0] for point in points[:-1]]
-        zfils = [point[1][0] for point in points[:-1]]
-
-        # Populating vessel with filaments
-        passive = []
-        for name, (R, Z) in enumerate(zip(rfils, zfils)):
-            passive.append(Filament(R, Z, 0.025, 0.025, 1, name='fil' + str(name)))
-
-        vessel = [Passive(passive, 'ivc', n_basis=6)]
-
-        return vessel
-
-    coils = [
-        (
-            "P1L",
-            ShapedCoil(
-                [(0.95, -1.15), (0.95, -1.05), (1.05, -1.05), (1.05, -1.15)])),
-        ("P1U",
-         ShapedCoil([(0.95, 1.15), (0.95, 1.05), (1.05, 1.05), (1.05, 1.15)])),
-        ("P2L", Coil(1.75, -0.6)),
-        ("P2U", Coil(1.75, 0.6, )),
-    ]
-
-    wall = Wall([0.75, 0.75, 1.5, 1.8, 1.8, 1.5,0.75],[0, 0.85, 0.85, 0.25, -0.25, -0.85,-0.85])
-
-    sensors = [RogowskiSensor([0.77, 0.77, 1.48, 1.78, 1.78, 1.48],
-                              [-0.83, 0.83, 0.83, 0.23, -0.23, -0.83], name='Rog1')
-        , PoloidalFieldSensor(1.8, 0.14, 2.2, name='BP1')
-        , PoloidalFieldSensor(1.8, -0.14, 2 * np.pi - 2.2, name='BP2')
-        , PoloidalFieldSensor(1.7, 0.475, 2.2, name='BP3')
-        , PoloidalFieldSensor(1.7, -0.475, 2 * np.pi - 2.2, name='BP4')
-        , PoloidalFieldSensor(1.5, 0.8, 2.2, name='BP5')
-        , PoloidalFieldSensor(1.5, -0.8, 2 * np.pi - 2.2, name='BP6')
-        , PoloidalFieldSensor(0.75, 0.14, 2.2, name='BP7')
-        , PoloidalFieldSensor(0.75, -0.14, 2 * np.pi - 2.2, name='BP8')
-        , PoloidalFieldSensor(0.75, 0.475, 2.2, name='BP9')
-        , PoloidalFieldSensor(0.75, -0.475, 2 * np.pi - 2.2, name='BP10')
-        , PoloidalFieldSensor(0.75, 0.8, 2.2, name='BP11')
-        , PoloidalFieldSensor(0.75, -0.8, 2 * np.pi - 2.2, name='BP12')
-        , FluxLoopSensor(1.78, 0.2, name='FL1')
-        , FluxLoopSensor(1.78, -0.2, name='FL2')
-        , FluxLoopSensor(1.65, 0.52, name='FL3')
-        , FluxLoopSensor(1.65, -0.52, name='FL4')
-        , FluxLoopSensor(1.75, 0.32, name='FL5')
-        , FluxLoopSensor(1.75, -0.32, name='FL6')
-        , FluxLoopSensor(1.1, 0.8, name='FL7')
-        , FluxLoopSensor(1.1, -0.8, name='FL8')
-        , FluxLoopSensor(1.4, 0.8, name='FL9')
-        , FluxLoopSensor(1.4, -0.8, name='FL10')
-        , FluxLoopSensor(0.75, 0.25, name='FL11')
-        , FluxLoopSensor(0.75, -0.25, name='FL12')
-        , RogowskiSensor([0.94, 0.94, 1.06, 1.06],
-                         [-1.16, -1.04, -1.04, -1.16], name='Rog2')
-        , RogowskiSensor([0.94, 0.94, 1.06, 1.06],
-                         [1.16, 1.04, 1.04, 1.16], name='Rog3')
-        , RogowskiSensor([1.74, 1.74, 1.76, 1.76],
-                         [-0.59, -0.61, -0.61, -0.59], name='Rog4')
-        , RogowskiSensor([1.74, 1.74, 1.76, 1.76],
-                         [0.59, 0.61, 0.61, 0.59], name='Rog5')
-               ]
-
-    vessel = createVesselFilaments(wall)
-
-    return Machine(coils, wall, sensors, vessel)
-
-
 def DIIID():
     """
-    PF coil set from ef20030203.d3d
-    Taken from Corsica
+    PF coil set and boundary from g file and GA webpage
     """
-
     coils = [
-        {"label": "F1A", "R": 0.8608, "Z": 0.16830, "current": 0.0},
-        {"label": "F2A", "R": 0.8614, "Z": 0.50810, "current": 0.0},
-        {"label": "F3A", "R": 0.8628, "Z": 0.84910, "current": 0.0},
-        {"label": "F4A", "R": 0.8611, "Z": 1.1899, "current": 0.0},
-        {"label": "F5A", "R": 1.0041, "Z": 1.5169, "current": 0.0},
-        {"label": "F6A", "R": 2.6124, "Z": 0.4376, "current": 0.0},
-        {"label": "F7A", "R": 2.3733, "Z": 1.1171, "current": 0.0},
-        {"label": "F8A", "R": 1.2518, "Z": 1.6019, "current": 0.0},
-        {"label": "F9A", "R": 1.6890, "Z": 1.5874, "current": 0.0},
-        {"label": "F1B", "R": 0.8608, "Z": -0.1737, "current": 0.0},
-        {"label": "F2B", "R": 0.8607, "Z": -0.5135, "current": 0.0},
-        {"label": "F3B", "R": 0.8611, "Z": -0.8543, "current": 0.0},
-        {"label": "F4B", "R": 0.8630, "Z": -1.1957, "current": 0.0},
-        {"label": "F5B", "R": 1.0025, "Z": -1.5169, "current": 0.0},
-        {"label": "F6B", "R": 2.6124, "Z": -0.44376, "current": 0.0},
-        {"label": "F7B", "R": 2.3834, "Z": -1.1171, "current": 0.0},
-        {"label": "F8B", "R": 1.2524, "Z": -1.6027, "current": 0.0},
-        {"label": "F9B", "R": 1.6889, "Z": -1.578, "current": 0.0},
+        ("FC1",ShapedCoil([[1.6042, -1.64455], [1.7736, -1.64455], [1.7736, -1.51145], [1.6042, -1.51145]])),
+        ("FC2",ShapedCoil([[0.8354, 0.00777], [0.8862, 0.00777], [0.8862, 0.32883], [0.8354, 0.32883]])),
+        ("FC3",ShapedCoil([[0.836, 0.34757], [0.8868, 0.34757], [0.8868, 0.66863], [0.836, 0.66863]])),
+        ("FC4",ShapedCoil([[0.8374, 0.68857], [0.8882, 0.68857], [0.8882, 1.00963], [0.8374, 1.00963]])),
+        ("FC5",ShapedCoil([[0.8357, 1.02937], [0.8865, 1.02937], [0.8865, 1.35043], [0.8357, 1.35043]])),
+        ("FC6",ShapedCoil([[0.9345, 1.3876], [1.0737, 1.5268], [1.0737, 1.6462], [0.9345, 1.507]])),
+        ("FC7",ShapedCoil([[2.5298, 0.3403], [2.703, 0.3403], [2.6949, 0.5349], [2.5217, 0.5349]])),
+        ("FC8",ShapedCoil([[2.5387, 1.0325], [2.7267, 1.0325], [2.2078, 1.2017], [2.0198, 1.2017]])),
+        ("FC9",ShapedCoil([[1.13435, 1.55935], [1.36925, 1.55935], [1.36925, 1.64445], [1.13435, 1.64445]])),
+        ("FC10",ShapedCoil([[1.6043, 1.52085], [1.7737, 1.52085], [1.7737, 1.65395], [1.6043, 1.65395]])),
+        ("FC11",ShapedCoil([[0.8354, -0.33423], [0.8862, -0.33423], [0.8862, -0.01317], [0.8354, -0.01317]])),
+        ("FC12",ShapedCoil([[0.8353, -0.67403], [0.8861, -0.67403], [0.8861, -0.35297], [0.8353, -0.35297]])),
+        ("FC13",ShapedCoil([[0.8357, -1.01483], [0.8865, -1.01483], [0.8865, -0.69377], [0.8357, -0.69377]])),
+        ("FC14",ShapedCoil([[0.8376, -1.35623], [0.8884, -1.35623], [0.8884, -1.03517], [0.8376, -1.03517]])),
+        ("FC15",ShapedCoil([[0.9329, -1.507], [1.0721, -1.6462], [1.0721, -1.5268], [0.9329, -1.3876]])),
+        ("FC16",ShapedCoil([[2.5217, -0.5349], [2.6949, -0.5349], [2.703, -0.3403], [2.5298, -0.3403]])),
+        ("FC17",ShapedCoil([[2.0299, -1.2017], [2.2179, -1.2017], [2.7368, -1.0325], [2.5488, -1.0325]])),
+        ("FC18",ShapedCoil([[1.13495, -1.64525], [1.36985, -1.64525], [1.36985, -1.56015], [1.13495, -1.56015]]))
     ]
 
-    return Machine(coils)
+    R = np.array([1.016,1.016,1.016,1.016,1.016,1.016,1.016,1.016,1.016,
+        1.016,1.016,1.012,1.001,1.029,1.042,1.046,1.056,1.097,
+        1.108,1.116,1.134,1.148,1.162,1.181,1.182,1.185,1.19,
+        1.195,1.201,1.209,1.215,1.222,1.228,1.234,1.239,1.242,
+        1.248,1.258,1.263,1.28,1.28,1.28,1.31,1.328,1.361,
+        1.38,1.419,1.419,1.372,1.37167,1.37003,1.36688,1.36719,1.37178,
+        1.37224,1.38662,1.38708,1.40382,1.41127,1.41857,1.421,1.48663,1.4973,
+        1.49762,1.49745,1.49275,1.4926,1.49261,1.49279,1.4934,1.4947,1.49622,
+        1.47981,1.48082,1.48149,1.48646,1.49095,1.50305,1.59697,1.6255,1.63752,
+        1.647,1.785,2.07,2.128,2.245,2.33956,2.34708,2.34913,2.35103,
+        2.35158,2.35125,2.35051,2.34965,2.3487,2.3476,2.3402,2.32942,2.134,
+        1.786,1.768,1.768,1.682,1.372,1.372,1.42,1.42,1.273,
+        1.153,1.016,1.016,1.016,1.016,1.016,1.016,1.016,1.016])
+    Z = np.array([ 0.00000e+00,9.64000e-01,9.68000e-01,1.00100e+00,1.01900e+00,
+        1.07700e+00,1.07000e+00,1.09600e+00,1.11300e+00,1.13800e+00,
+        1.14700e+00,1.16500e+00,1.21700e+00,1.21700e+00,1.16240e+00,
+        1.16238e+00,1.16260e+00,1.16450e+00,1.16594e+00,1.16591e+00,
+        1.16896e+00,1.17175e+00,1.17556e+00,1.18300e+00,1.18350e+00,
+        1.18500e+00,1.18800e+00,1.19100e+00,1.19600e+00,1.20200e+00,
+        1.20800e+00,1.21400e+00,1.22100e+00,1.23100e+00,1.23800e+00,
+        1.24400e+00,1.25400e+00,1.27800e+00,1.29000e+00,1.33100e+00,
+        1.34700e+00,1.34800e+00,1.34800e+00,1.34800e+00,1.34800e+00,
+        1.34800e+00,1.34800e+00,1.31000e+00,1.31000e+00,1.29238e+00,
+        1.28268e+00,1.25644e+00,1.22955e+00,1.19576e+00,1.19402e+00,
+        1.16487e+00,1.16421e+00,1.15696e+00,1.15730e+00,1.16132e+00,
+        1.16400e+00,1.24050e+00,1.23458e+00,1.23428e+00,1.23174e+00,
+        1.21330e+00,1.21061e+00,1.20486e+00,1.20214e+00,1.19642e+00,
+        1.18511e+00,1.16070e+00,1.12426e+00,1.12256e+00,1.12138e+00,
+        1.11692e+00,1.11439e+00,1.11244e+00,1.09489e+00,1.08530e+00,
+        1.07988e+00,1.07700e+00,1.07700e+00,1.04000e+00,9.93000e-01,
+        7.09000e-01,4.61430e-01,4.15830e-01,2.72180e-01,1.70180e-01,
+        7.01200e-02, -3.17900e-02, -1.44350e-01, -2.14830e-01, -3.26690e-01,
+        -3.86770e-01, -4.53040e-01, -4.77570e-01, -9.73000e-01, -1.17400e+00,
+        -1.21100e+00, -1.25000e+00, -1.25000e+00, -1.25000e+00, -1.32900e+00,
+        -1.32900e+00, -1.36300e+00, -1.36300e+00, -1.36300e+00, -1.22300e+00,
+        -1.22300e+00, -8.30000e-01, -8.00000e-01, -4.15000e-01, -4.00000e-01,
+        -1.00000e-03,0.00000e+00])
+    wall = Wall(R,Z)
+
+    return Machine(coils,wall=wall)
 
 
 def MAST():
